@@ -416,9 +416,7 @@ def main():
         else:
             module.fail_json(msg='python-apt is not installed, and install_python_apt is False')
 
-    if not (isinstance(distro, aptsources_distro.UbuntuDistribution) or \
-            isinstance(distro, aptsources_distro.DebianDistribution) or \
-            isinstance(distro, aptsources_distro.Distribution)):
+    if not isinstance(distro, aptsources_distro.Distribution):
         module.fail_json(msg='Module apt_repository supports only Debian and Ubuntu.')
 
     sourceslist = SourcesList(module,
