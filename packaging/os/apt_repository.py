@@ -30,7 +30,6 @@ description:
 notes:
     - This module works on Debian and Ubuntu and requires C(python-apt).
     - This module supports Debian Squeeze (version 6) as well as its successors.
-    - This module treats Debian and Ubuntu distributions separately. So PPA could be installed only on Ubuntu machines.
 options:
     repo:
         required: true
@@ -79,7 +78,8 @@ apt_repository: repo='deb-src http://archive.canonical.com/ubuntu hardy partner'
 apt_repository: repo='deb http://archive.canonical.com/ubuntu hardy partner' state=absent
 
 # On Ubuntu target: add nginx stable repository from PPA and install its signing key.
-# On Debian target: adding PPA is not available, so it will fail immediately.
+# On Debian target: the repository will be added, but PPAs are not packaged for Debian,
+# so it's unlikely to work.
 apt_repository: repo='ppa:nginx/stable'
 '''
 
@@ -98,7 +98,7 @@ except ImportError:
     distro = None
     HAVE_PYTHON_APT = False
 
-
+LP_API = 'https://launchpad.net/api/1.0/~%s/+archive/%s'
 VALID_SOURCE_TYPES = ('deb', 'deb-src')
 
 def install_python_apt(module):
@@ -122,10 +122,12 @@ class InvalidSource(Exception):
 
 
 # Simple version of aptsources.sourceslist.SourcesList.
-# No advanced logic and no backups inside.
 class SourcesList(object):
-    def __init__(self):
+    def __init__(self, module, add_ppa_signing_keys_callback=None):
+        self.module = module
         self.files = {}  # group sources by file
+        self.add_ppa_signing_keys_callback = add_ppa_signing_keys_callback
+
         # Repositories that we're adding -- used to implement mode param
         self.new_repos = set()
         self.default_file = self._apt_cfg_file('Dir::Etc::sourcelist')
@@ -306,10 +308,21 @@ class SourcesList(object):
             self.new_repos.add(file)
 
     def add_source(self, line, comment='', file=None):
-        source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
+        if line.startswith('ppa:'):
+            source, ppa_owner, ppa_name = self._expand_ppa(line)
 
-        # Prefer separate files for new sources.
-        self._add_valid_source(source, comment, file=file or self._suggest_filename(source))
+            if self.add_ppa_signing_keys_callback is not None:
+                info = self._get_ppa_info(ppa_owner, ppa_name)
+                if not self._key_already_exists(info['signing_key_fingerprint']):
+                    command = ['apt-key', 'adv', '--recv-keys', '--keyserver', 'hkp://keyserver.ubuntu.com:80', info['signing_key_fingerprint']]
+                    self.add_ppa_signing_keys_callback(command)
+
+            file = file or self._suggest_filename('%s_%s' % (line, distro.codename))
+        else:
+            source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
+            file = file or self._suggest_filename(source)
+
+        self._add_valid_source(source, comment, file)
 
     def _remove_valid_source(self, source):
         # If we have more than one entry, we will remove them all (not comment, remove!)
@@ -318,21 +331,14 @@ class SourcesList(object):
                 self.files[filename].pop(n)
 
     def remove_source(self, line):
-        source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
+        if line.startswith('ppa:'):
+            source = self._expand_ppa(line)[0]
+        else:
+            source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
         self._remove_valid_source(source)
 
-
-class UbuntuSourcesList(SourcesList):
-
-    LP_API = 'https://launchpad.net/api/1.0/~%s/+archive/%s'
-
-    def __init__(self, module, add_ppa_signing_keys_callback=None):
-        self.module = module
-        self.add_ppa_signing_keys_callback = add_ppa_signing_keys_callback
-        super(UbuntuSourcesList, self).__init__()
-
     def _get_ppa_info(self, owner_name, ppa_name):
-        lp_api = self.LP_API % (owner_name, ppa_name)
+        lp_api = LP_API % (owner_name, ppa_name)
 
         headers = dict(Accept='application/json')
         response, info = fetch_url(self.module, lp_api, headers=headers)
@@ -354,29 +360,6 @@ class UbuntuSourcesList(SourcesList):
     def _key_already_exists(self, key_fingerprint):
         rc, out, err = self.module.run_command('apt-key export %s' % key_fingerprint, check_rc=True)
         return len(err) == 0
-
-    def add_source(self, line, comment='', file=None):
-        if line.startswith('ppa:'):
-            source, ppa_owner, ppa_name = self._expand_ppa(line)
-
-            if self.add_ppa_signing_keys_callback is not None:
-                info = self._get_ppa_info(ppa_owner, ppa_name)
-                if not self._key_already_exists(info['signing_key_fingerprint']):
-                    command = ['apt-key', 'adv', '--recv-keys', '--keyserver', 'hkp://keyserver.ubuntu.com:80', info['signing_key_fingerprint']]
-                    self.add_ppa_signing_keys_callback(command)
-
-            file = file or self._suggest_filename('%s_%s' % (line, distro.codename))
-        else:
-            source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
-            file = file or self._suggest_filename(source)
-        self._add_valid_source(source, comment, file)
-
-    def remove_source(self, line):
-        if line.startswith('ppa:'):
-            source = self._expand_ppa(line)[0]
-        else:
-            source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
-        self._remove_valid_source(source)
 
     @property
     def repos_urls(self):
@@ -426,7 +409,6 @@ def main():
     repo = module.params['repo']
     state = module.params['state']
     update_cache = module.params['update_cache']
-    sourceslist = None
 
     if not HAVE_PYTHON_APT:
         if params['install_python_apt']:
@@ -434,13 +416,13 @@ def main():
         else:
             module.fail_json(msg='python-apt is not installed, and install_python_apt is False')
 
-    if isinstance(distro, aptsources_distro.UbuntuDistribution):
-        sourceslist = UbuntuSourcesList(module,
-            add_ppa_signing_keys_callback=get_add_ppa_signing_key_callback(module))
-    elif isinstance(distro, aptsources_distro.DebianDistribution) or isinstance(distro, aptsources_distro.Distribution):
-        sourceslist = SourcesList()
-    else:
+    if not (isinstance(distro, aptsources_distro.UbuntuDistribution) or \
+            isinstance(distro, aptsources_distro.DebianDistribution) or \
+            isinstance(distro, aptsources_distro.Distribution)):
         module.fail_json(msg='Module apt_repository supports only Debian and Ubuntu.')
+
+    sourceslist = SourcesList(module,
+        add_ppa_signing_keys_callback=get_add_ppa_signing_key_callback(module))
 
     sources_before = sourceslist.dump()
 
