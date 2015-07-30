@@ -321,6 +321,21 @@ class SourcesList(object):
         source = self._parse(line, raise_if_invalid_or_disabled=True)[2]
         self._remove_valid_source(source)
 
+    @property
+    def repos_urls(self):
+        _repositories = []
+        for parsed_repos in self.files.values():
+            for parsed_repo in parsed_repos:
+                enabled = parsed_repo[1]
+                source_line = parsed_repo[3]
+
+                if not enabled:
+                    continue
+
+                _repositories.append(source_line)
+
+        return _repositories
+
 
 class UbuntuSourcesList(SourcesList):
 
